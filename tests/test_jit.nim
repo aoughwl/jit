@@ -1,6 +1,6 @@
 ## Run: nimony c -p:src tests/test_jit.nim  (then the binary). x86-64 only.
 import std/syncio
-import aowljit
+import jit
 
 var failures = 0
 var total = 0
