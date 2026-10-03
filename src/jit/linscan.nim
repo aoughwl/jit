@@ -1,5 +1,5 @@
-## Linear-scan register assignment for the optimizing tier (the aowljs engine imports it
-## as a separate module).
+## Linear-scan register assignment for the optimizing tier (a separately
+## imported module: the jsengine module is at nimony's size limit).
 ## Locations: >= 0 and < 100 a general register, >= 100 xmm (100 + n),
 ## < 0 a spill slot -(k+1).
 
@@ -20,12 +20,23 @@ proc depthWeight*(d: int): float =
 
 proc linearScan*(vals: seq[int]; start, stop: seq[int]; weight: seq[float];
                  wantX, crosses: seq[bool]; gprPool: seq[int]; xmmFirst: int;
-                 loc: var seq[int]; nslots: var int; hint: seq[int] = @[]) =
+                 loc: var seq[int]; nslots: var int; hint: seq[int] = @[];
+                 ghint: seq[int] = @[]; calleeSavedFirst = false) =
   ## vals sorted by start. When no register is free, the value with the least
   ## weight per unit of lifetime lives in a slot (v itself when cheapest).
   var active: seq[int] = @[]
   var gprFree: seq[int] = @[]
-  for r in gprPool: gprFree.add r
+  # (taken from the end: the pool's first registers first - the caller-saved
+  # ones, which a region need not save - unless calleeSavedFirst: C helpers
+  # called in the code keep those, and the caller-saved ones would be saved
+  # around each)
+  if calleeSavedFirst:
+    for r in gprPool: gprFree.add r
+  else:
+    var ri = gprPool.len - 1
+    while ri >= 0:
+      gprFree.add gprPool[ri]
+      dec ri
   var xmmFree: seq[int] = @[]
   for i in xmmFirst .. 15: xmmFree.add 100 + i
   for v in vals:
@@ -53,7 +64,12 @@ proc linearScan*(vals: seq[int]; start, stop: seq[int]; weight: seq[float];
       loc[v] = xmmFree.pop()
       active.add v
     elif not crosses[v] and not wx and gprFree.len > 0:
-      loc[v] = gprFree.pop()
+      # (a wanted register when free: a direct call's argument register)
+      let gk = if v < ghint.len and ghint[v] >= 0: gprFree.find(ghint[v]) else: -1
+      if gk >= 0:
+        loc[v] = gprFree[gk]
+        gprFree.delete(gk)
+      else: loc[v] = gprFree.pop()
       active.add v
     else:
       var victim = -1

@@ -147,16 +147,27 @@ proc memRex(a: var Assembler; w: bool; reg: int; m: Mem; force = false) =
 proc modrmReg(a: var Assembler; reg, rm: int) =
   a.emit8 0xC0 or ((reg and 7) shl 3) or (rm and 7)
 
-proc modrmMem(a: var Assembler; reg: int; m: Mem) =
-  ## ModRM (+SIB) (+disp) for [base + index*scale + disp]. rsp/r12 as base
-  ## need a SIB byte; rbp/r13 as base cannot use the no-displacement form.
+# (the encoders below check the buffer's room once - an instruction is at
+# most 15 bytes - and store through a local cursor: the per-byte emit8 of
+# the plain forms was a good part of every compile)
+proc put8(a: var Assembler; n: var int; b: int) {.inline.} =
+  bufAt(a, n)[] = byte(b and 0xFF)
+  inc n
+
+proc rexOf(w: bool; r, x, b: int): int {.inline.} =
+  result = 0x40
+  if w: result = result or 8
+  if (r and 8) != 0: result = result or 4
+  if (x and 8) != 0: result = result or 2
+  if (b and 8) != 0: result = result or 1
+
+proc putModrmMem(a: var Assembler; n: var int; reg: int; m: Mem) {.inline.} =
   let b = ord(m.base) and 7
   var md = 2
   if m.disp == 0 and b != 5: md = 0
   elif fits8(m.disp): md = 1
-  let needSib = m.index >= 0 or b == 4
-  if needSib:
-    a.emit8 (md shl 6) or ((reg and 7) shl 3) or 4
+  if m.index >= 0 or b == 4:
+    a.put8(n, (md shl 6) or ((reg and 7) shl 3) or 4)
     var ss = 0
     case m.scale
     of 2: ss = 1
@@ -164,37 +175,64 @@ proc modrmMem(a: var Assembler; reg: int; m: Mem) =
     of 8: ss = 3
     else: ss = 0
     let idx = if m.index >= 0: m.index and 7 else: 4
-    a.emit8 (ss shl 6) or (idx shl 3) or b
+    a.put8(n, (ss shl 6) or (idx shl 3) or b)
   else:
-    a.emit8 (md shl 6) or ((reg and 7) shl 3) or b
-  if md == 1: a.emit8 int(m.disp)
-  elif md == 2: a.emit32 m.disp
+    a.put8(n, (md shl 6) or ((reg and 7) shl 3) or b)
+  if md == 1: a.put8(n, int(m.disp))
+  elif md == 2:
+    var u = cast[uint32](m.disp)
+    copyMem(bufAt(a, n), addr u, 4)
+    n = n + 4
+
+proc modrmMem(a: var Assembler; reg: int; m: Mem) =
+  ## ModRM (+SIB) (+disp) for [base + index*scale + disp]. rsp/r12 as base
+  ## need a SIB byte; rbp/r13 as base cannot use the no-displacement form.
+  room(a, 8)
+  var n = a.n
+  a.putModrmMem(n, reg, m)
+  a.n = n
 
 # register-register / register-memory forms, 64-bit (w) or 32-bit
 proc opRR(a: var Assembler; w: bool; op: openArray[int]; reg, rm: int) =
-  a.rex(w, reg, 0, rm)
-  for o in op: a.emit8 o
-  a.modrmReg(reg, rm)
+  room(a, 16)
+  var n = a.n
+  let v = rexOf(w, reg, 0, rm)
+  if v != 0x40: a.put8(n, v)
+  for o in op: a.put8(n, o)
+  a.put8(n, 0xC0 or ((reg and 7) shl 3) or (rm and 7))
+  a.n = n
 
 proc opRM(a: var Assembler; w: bool; op: openArray[int]; reg: int; m: Mem) =
-  a.memRex(w, reg, m)
-  for o in op: a.emit8 o
-  a.modrmMem(reg, m)
+  room(a, 16)
+  var n = a.n
+  let v = rexOf(w, reg, (if m.index >= 0: m.index else: 0), ord(m.base))
+  if v != 0x40: a.put8(n, v)
+  for o in op: a.put8(n, o)
+  a.putModrmMem(n, reg, m)
+  a.n = n
 
 # SSE: mandatory prefix, then REX, then 0F xx
 proc sseRR(a: var Assembler; prefix: int; w: bool; op: int; reg, rm: int) =
-  if prefix != 0: a.emit8 prefix
-  a.rex(w, reg, 0, rm)
-  a.emit8 0x0F
-  a.emit8 op
-  a.modrmReg(reg, rm)
+  room(a, 16)
+  var n = a.n
+  if prefix != 0: a.put8(n, prefix)
+  let v = rexOf(w, reg, 0, rm)
+  if v != 0x40: a.put8(n, v)
+  a.put8(n, 0x0F)
+  a.put8(n, op)
+  a.put8(n, 0xC0 or ((reg and 7) shl 3) or (rm and 7))
+  a.n = n
 
 proc sseRM(a: var Assembler; prefix: int; w: bool; op: int; reg: int; m: Mem) =
-  if prefix != 0: a.emit8 prefix
-  a.memRex(w, reg, m)
-  a.emit8 0x0F
-  a.emit8 op
-  a.modrmMem(reg, m)
+  room(a, 16)
+  var n = a.n
+  if prefix != 0: a.put8(n, prefix)
+  let v = rexOf(w, reg, (if m.index >= 0: m.index else: 0), ord(m.base))
+  if v != 0x40: a.put8(n, v)
+  a.put8(n, 0x0F)
+  a.put8(n, op)
+  a.putModrmMem(n, reg, m)
+  a.n = n
 
 # --- labels ----------------------------------------------------------------------
 
@@ -277,9 +315,13 @@ proc movImm*(a: var Assembler; dst: Reg; imm: int64) =
 
 proc movImm64*(a: var Assembler; dst: Reg; imm: uint64) =
   ## Always the 10-byte movabs form (patchable; flags untouched).
-  a.rex(true, 0, 0, ord(dst))
-  a.emit8 0xB8 + (ord(dst) and 7)
-  a.emit64 imm
+  room(a, 16)
+  var n = a.n
+  a.put8(n, rexOf(true, 0, 0, ord(dst)))
+  a.put8(n, 0xB8 + (ord(dst) and 7))
+  var u = imm
+  copyMem(bufAt(a, n), addr u, 8)
+  a.n = n + 8
 
 proc movPtr*(a: var Assembler; dst: Reg; p: pointer) =
   a.movImm64(dst, cast[uint64](p))
@@ -513,25 +555,40 @@ proc cmov*(a: var Assembler; c: Cond; dst, src: Reg) =
 
 # --- control flow --------------------------------------------------------------------
 
+proc branchTo(a: var Assembler; n: var int; l: Label; p: int) {.inline.} =
+  ## the rel32 field at n (room already made) aimed at `l` (bound at p, or
+  ## a fixup)
+  var v = 0'i32
+  if p >= 0: v = int32(p - (n + 4))
+  else: a.fixups.add Fixup(pos: n, label: int(l))
+  copyMem(bufAt(a, n), addr v, 4)
+  n = n + 4
+
 proc jmp*(a: var Assembler; l: Label) =
   ## jmp rel32 (rel8 when the target is bound and close)
   let p = a.labelPos[int(l)]
-  if p >= 0 and fits8(p - (a.n + 2)):
-    a.emit8 0xEB
-    a.emit8 p - (a.n + 1)
-    return
-  a.emit8 0xE9
-  a.rel32To(l)
+  room(a, 8)
+  var n = a.n
+  if p >= 0 and fits8(p - (n + 2)):
+    a.put8(n, 0xEB)
+    a.put8(n, p - (n + 1))
+  else:
+    a.put8(n, 0xE9)
+    a.branchTo(n, l, p)
+  a.n = n
 
 proc jcc*(a: var Assembler; c: Cond; l: Label) =
   let p = a.labelPos[int(l)]
-  if p >= 0 and fits8(p - (a.n + 2)):
-    a.emit8 0x70 + ord(c)
-    a.emit8 p - (a.n + 1)
-    return
-  a.emit8 0x0F
-  a.emit8 0x80 + ord(c)
-  a.rel32To(l)
+  room(a, 8)
+  var n = a.n
+  if p >= 0 and fits8(p - (n + 2)):
+    a.put8(n, 0x70 + ord(c))
+    a.put8(n, p - (n + 1))
+  else:
+    a.put8(n, 0x0F)
+    a.put8(n, 0x80 + ord(c))
+    a.branchTo(n, l, p)
+  a.n = n
 
 proc jmpReg*(a: var Assembler; r: Reg) = a.opRR(false, [0xFF], 4, ord(r))
 proc jmpMem*(a: var Assembler; m: Mem) = a.opRM(false, [0xFF], 4, m)
@@ -612,6 +669,7 @@ proc cvttsd2si32*(a: var Assembler; dst: Reg; src: Xmm) =
 
 proc xorpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x57, ord(dst), ord(src))
 proc andpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x54, ord(dst), ord(src))
+proc orpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x56, ord(dst), ord(src))
 
 # --- frames ----------------------------------------------------------------------------
 

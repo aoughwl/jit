@@ -31,6 +31,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -72,6 +75,32 @@ static int64_t jit_protect(void* p, int64_t size, int64_t exec) {
 #endif
 }
 
+/* A dual-mapped region (Linux): one memfd mapped read+write (where code is
+   written) and read+execute (where it runs) - no page is ever writable and
+   executable in the same mapping, yet code is packed densely and installing
+   it needs no system call. *rx gets the executable view; the result is the
+   writable one (0: not available, use per-install mprotect instead). */
+static int64_t jit_map_dual(int64_t size, int64_t* rx) {
+#if defined(__linux__)
+  int fd = memfd_create("aowljs-jit", MFD_CLOEXEC);
+  if (fd < 0) return 0;
+  if (ftruncate(fd, (off_t)size) != 0) { close(fd); return 0; }
+  void* w = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (w == MAP_FAILED) { close(fd); return 0; }
+  void* x = mmap(NULL, (size_t)size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+  close(fd);
+  if (x == MAP_FAILED) { munmap(w, (size_t)size); return 0; }
+  *rx = (int64_t)(intptr_t)x;
+  return (int64_t)(intptr_t)w;
+#else
+  (void)size; (void)rx; return 0;
+#endif
+}
+
+static void jit_copy(void* dst, const void* src, int64_t n) { memcpy(dst, src, (size_t)n); }
+#include <stdlib.h>
+static void* jit_calloc(int64_t n) { return calloc((size_t)n, 8); }
+
 static void jit_poke(void* base, int64_t off, int64_t b) { ((uint8_t*)base)[off] = (uint8_t)b; }
 static int64_t jit_peek(void* base, int64_t off) { return ((uint8_t*)base)[off]; }
 static void* jit_offset(void* base, int64_t off) { return (void*)((uint8_t*)base + off); }
@@ -97,6 +126,11 @@ proc jit_map(size: int64): pointer {.importc, nodecl.}
 proc jit_unmap(p: pointer; size: int64): int64 {.importc, nodecl.}
 proc jit_protect(p: pointer; size: int64; exec: int64): int64 {.importc, nodecl.}
 proc jit_poke(base: pointer; off: int64; b: int64) {.importc, nodecl.}
+proc jit_map_dual(size: int64; rx: ptr int64): int64 {.importc, nodecl.}
+proc jit_copy(dst, src: pointer; n: int64) {.importc, nodecl.}
+proc jit_calloc(n: int64): pointer {.importc, nodecl.}
+proc callocWords*(n: int): pointer = jit_calloc(int64(n))
+  ## n zeroed 8-byte words that never move (nil if they cannot be had)
 proc jit_peek(base: pointer; off: int64): int64 {.importc, nodecl.}
 proc jit_offset(base: pointer; off: int64): pointer {.importc, nodecl.}
 proc jit_ptr_int(p: pointer): int64 {.importc, nodecl.}
@@ -138,13 +172,16 @@ type
   CodeRegion = object
     base: pointer
     size: int
-    used: int          ## bytes handed out (always page-aligned)
+    used: int          ## bytes handed out (page-aligned; 16-byte aligned when dual)
+    wbase: int         ## dual-mapped: the writable view of `base` (else 0)
 
   JitMemory* = object
     regions: seq[CodeRegion]
     pageSize*: int
     regionSize*: int
     totalCode*: int    ## bytes of code installed
+
+var jitDualMap* = true  ## --jit-mem=pages: every install on pages of its own (mprotect)
 
 proc initJitMemory*(regionSize = 65536): JitMemory =
   let ps = int(jit_page_size())
@@ -154,32 +191,59 @@ proc initJitMemory*(regionSize = 65536): JitMemory =
   JitMemory(regions: @[], pageSize: ps, regionSize: rs, totalCode: 0)
 
 proc install*(jm: var JitMemory; code: seq[byte]): pointer =
-  ## Copies `code` into fresh read-write pages, flips them to read-execute
-  ## and returns the entry address (nil if memory could not be mapped or
-  ## protected).
+  ## Copies `code` into executable memory and returns the entry address (nil
+  ## if memory could not be mapped or protected). Dual-mapped regions (Linux)
+  ## pack code densely: written through the read-write view, run from the
+  ## read-execute one. Otherwise: fresh read-write pages, flipped to
+  ## read-execute.
   let n = code.len
   if n == 0: return nil
   let ps = jm.pageSize
+  let last = jm.regions.len - 1
+  if last >= 0 and jm.regions[last].wbase != 0:
+    let need = (n + 15) and not 15
+    if jm.regions[last].size - jm.regions[last].used >= need:
+      let off = jm.regions[last].used
+      jit_copy(cast[pointer](jm.regions[last].wbase + off), addr code[0], n)
+      jm.regions[last].used = off + need
+      jm.totalCode = jm.totalCode + n
+      return jit_offset(jm.regions[last].base, off)
+  if jitDualMap:
+    let size = max(jm.regionSize, ((n + ps - 1) div ps) * ps)
+    var rx = 0'i64
+    let w = jit_map_dual(size, addr rx)
+    if w != 0:
+      jm.regions.add CodeRegion(base: cast[pointer](rx), size: size, used: 0, wbase: int(w))
+      return jm.install(code)
+    jitDualMap = false
   let need = ((n + ps - 1) div ps) * ps
   var ri = -1
-  if jm.regions.len > 0:
-    let last = jm.regions.len - 1
+  if last >= 0 and jm.regions[last].wbase == 0:
     if jm.regions[last].size - jm.regions[last].used >= need: ri = last
   if ri < 0:
     let size = max(jm.regionSize, need)
     let base = jit_map(size)
     if base == nil: return nil
-    jm.regions.add CodeRegion(base: base, size: size, used: 0)
+    jm.regions.add CodeRegion(base: base, size: size, used: 0, wbase: 0)
     ri = jm.regions.len - 1
   let dst = jit_offset(jm.regions[ri].base, jm.regions[ri].used)
-  for i in 0 ..< n: jit_poke(dst, i, int64(code[i]))
+  jit_copy(dst, addr code[0], n)
   if jit_protect(dst, need, 1) != 0: return nil
   jm.regions[ri].used = jm.regions[ri].used + need
   jm.totalCode = jm.totalCode + n
   dst
 
+proc detachShared*(jm: var JitMemory) =
+  ## In a forked child (agents.nim): dual-mapped regions are MAP_SHARED, so
+  ## the parent and the child would both install code into the same free
+  ## space. The child stops using every region it inherited (it still runs
+  ## the code in them) and maps fresh ones of its own.
+  for i in 0 ..< jm.regions.len: jm.regions[i].used = jm.regions[i].size
+
 proc release*(jm: var JitMemory) =
   ## Unmaps every region; all code installed from `jm` becomes invalid.
-  for r in jm.regions: discard jit_unmap(r.base, r.size)
+  for r in jm.regions:
+    discard jit_unmap(r.base, r.size)
+    if r.wbase != 0: discard jit_unmap(cast[pointer](r.wbase), r.size)
   jm.regions = @[]
   jm.totalCode = 0
