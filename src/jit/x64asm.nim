@@ -47,6 +47,8 @@ type
                          ## allocator for its size. `finalize` trims it to `n`.
     labelPos: seq[int]   ## bound position, or -1
     fixups: seq[Fixup]
+    lastBind*: int       ## where a label was bound last (-1: none yet): code
+                         ## emitted since was entered only by falling through
 
   AluOp* = enum
     ## the /digit of the classic ALU group (and the opcode row)
@@ -80,7 +82,7 @@ proc mem*(base: Reg; index: Reg; scale: int; disp: int32 = 0): Mem =
   Mem(base: base, index: ord(index), scale: scale, disp: disp)
 
 proc initAssembler*(): Assembler =
-  Assembler(buf: @[], n: 0, labelPos: @[], fixups: @[])
+  Assembler(buf: @[], n: 0, labelPos: @[], fixups: @[], lastBind: -1)
 
 proc pos*(a: Assembler): int = a.n
 
@@ -243,6 +245,7 @@ proc newLabel*(a: var Assembler): Label =
 proc bindLabel*(a: var Assembler; l: Label) =
   ## Places `l` at the current position.
   a.labelPos[int(l)] = a.n
+  a.lastBind = a.n
 
 proc hereLabel*(a: var Assembler): Label =
   ## A new label bound at the current position (a backward-branch target).
