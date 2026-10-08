@@ -29,11 +29,13 @@ type
     cGreater
 
   Mem* = object
-    ## [base + index*scale + disp]; index = -1 when there is none
+    ## [base + index*scale + disp]; index = -1 when there is none.
+    ## `isAbs` is a bare 32-bit absolute address [disp] (no base/index).
     base*: Reg
     index*: int
     scale*: int
     disp*: int32
+    isAbs*: bool
 
   Label* = distinct int
 
@@ -78,6 +80,10 @@ proc mem*(base: Reg; disp: int32 = 0): Mem =
 proc mem*(base: Reg; index: Reg; scale: int; disp: int32 = 0): Mem =
   ## `index` may not be rsp; `scale` is 1, 2, 4 or 8.
   Mem(base: base, index: ord(index), scale: scale, disp: disp)
+
+proc memAbs*(disp: int32): Mem =
+  ## A bare absolute address [disp32] (sign-extended to 64 bits in long mode).
+  Mem(base: rax, index: -1, scale: 1, disp: disp, isAbs: true)
 
 proc initAssembler*(): Assembler =
   Assembler(buf: @[], n: 0, labelPos: @[], fixups: @[])
@@ -162,6 +168,14 @@ proc rexOf(w: bool; r, x, b: int): int {.inline.} =
   if (b and 8) != 0: result = result or 1
 
 proc putModrmMem(a: var Assembler; n: var int; reg: int; m: Mem) {.inline.} =
+  if m.isAbs:
+    # [disp32] absolute: mod=00, rm=100 (SIB); SIB base=101 index=100 (none)
+    a.put8(n, (0 shl 6) or ((reg and 7) shl 3) or 4)
+    a.put8(n, (0 shl 6) or (4 shl 3) or 5)
+    var u = cast[uint32](m.disp)
+    copyMem(bufAt(a, n), addr u, 4)
+    n = n + 4
+    return
   let b = ord(m.base) and 7
   var md = 2
   if m.disp == 0 and b != 5: md = 0
@@ -467,6 +481,10 @@ proc cmpMem32*(a: var Assembler; x: Reg; m: Mem) =
 proc test*(a: var Assembler; x, y: Reg) =
   a.opRR(true, [0x85], ord(y), ord(x))
 
+proc testMem*(a: var Assembler; x: Reg; m: Mem) =
+  ## sets flags from x and qword [m] (non-destructive); test [m], x
+  a.opRM(true, [0x85], ord(x), m)
+
 proc testImm*(a: var Assembler; x: Reg; imm: int32) =
   a.opRR(true, [0xF7], 0, ord(x))
   a.emit32 imm
@@ -667,6 +685,8 @@ proc cvttsd2si32*(a: var Assembler; dst: Reg; src: Xmm) =
   ## double -> int32 in dst32 (0x80000000 when out of range/NaN)
   a.sseRR(0xF2, false, 0x2C, ord(dst), ord(src))
 
+# packed subtract of two 64-bit lanes; m is a 16-byte-aligned m128
+proc psubq*(a: var Assembler; dst: Xmm; m: Mem) = a.sseRM(0x66, false, 0xFB, ord(dst), m)
 proc xorpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x57, ord(dst), ord(src))
 proc andpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x54, ord(dst), ord(src))
 proc orpd*(a: var Assembler; dst, src: Xmm) = a.sseRR(0x66, false, 0x56, ord(dst), ord(src))
