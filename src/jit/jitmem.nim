@@ -175,11 +175,31 @@ type
     used: int          ## bytes handed out (page-aligned; 16-byte aligned when dual)
     wbase: int         ## dual-mapped: the writable view of `base` (else 0)
 
+  FreeSlot* = object
+    region*: int
+    off*: int
+    size*: int    ## always a multiple of 16 (every slot came from a prior
+                  ## install()'s `need`, which is always 16-byte rounded)
+
   JitMemory* = object
     regions: seq[CodeRegion]
     pageSize*: int
     regionSize*: int
     totalCode*: int    ## bytes of code installed
+    freeList*: seq[FreeSlot]
+      ## dual-mapped-region-only slots freed by `freeRange` and available for
+      ## `install` to reuse via first-fit, checked before any bump allocation.
+      ## Stays empty forever unless something calls `freeRange` - a caller
+      ## that never does gets the exact old bump-only behaviour, free.
+    lastLen*: int      ## the TRUE rounded span of the most recent install() (not
+                        ## the raw byte count passed in) - the bump pointer always
+                        ## advances by exactly this many bytes, so this is what a
+                        ## caller that wants to know "how much space did that
+                        ## installation really occupy" must record, not code.len.
+                        ## (A caller that used code.len instead would track a
+                        ## range up to 15 bytes short of the true footprint -
+                        ## root cause of a reclaim-corruption bug; see the
+                        ## engine's DESIGN.md history for the repro.)
 
 var jitDualMap* = true  ## --jit-mem=pages: every install on pages of its own (mprotect)
 
@@ -188,16 +208,56 @@ proc initJitMemory*(regionSize = 65536): JitMemory =
   var rs = regionSize
   if rs < ps: rs = ps
   rs = ((rs + ps - 1) div ps) * ps
-  JitMemory(regions: @[], pageSize: ps, regionSize: rs, totalCode: 0)
+  JitMemory(regions: @[], pageSize: ps, regionSize: rs, totalCode: 0, freeList: @[], lastLen: 0)
+
+proc freeRange*(jm: var JitMemory; addrAbs: int; len: int) =
+  ## Mark [addrAbs, addrAbs+len) as free for a future install() to reuse, IF
+  ## addrAbs falls inside a dual-mapped region (one with a writable alias) -
+  ## that is the only kind this pass can safely write into again later
+  ## (no re-mprotect cycle needed: code is already read-execute via `base`,
+  ## reused code is written through the separate `wbase` alias exactly like
+  ## a fresh install would be). Addresses in a non-dual-mapped (page-granular,
+  ## flip-protected) region are silently ignored - not a bug, just out of
+  ## scope for this mechanism; such a region's space is never reclaimed here.
+  ## The caller is responsible for len being the installation's TRUE span (as
+  ## returned via `jm.lastLen` at install time), not a raw/unrounded size -
+  ## passing anything else reintroduces the exact accounting bug this
+  ## mechanism exists to avoid.
+  for ri in 0 ..< jm.regions.len:
+    if jm.regions[ri].wbase == 0: continue
+    let base = cast[int](jm.regions[ri].base)
+    if addrAbs >= base and addrAbs < base + jm.regions[ri].size:
+      jm.freeList.add FreeSlot(region: ri, off: addrAbs - base, size: len)
+      return
 
 proc install*(jm: var JitMemory; code: seq[byte]): pointer =
   ## Copies `code` into executable memory and returns the entry address (nil
   ## if memory could not be mapped or protected). Dual-mapped regions (Linux)
   ## pack code densely: written through the read-write view, run from the
   ## read-execute one. Otherwise: fresh read-write pages, flipped to
-  ## read-execute.
+  ## read-execute. Sets `jm.lastLen` to the true rounded span actually
+  ## occupied (always do this, even on the nil/failure paths that don't
+  ## advance a bump pointer, so a caller can't accidentally read a stale
+  ## value from a PRIOR successful install after this one failed).
   let n = code.len
-  if n == 0: return nil
+  if n == 0:
+    jm.lastLen = 0
+    return nil
+  let needEarly = (n + 15) and not 15
+  if jm.freeList.len > 0:
+    for si in 0 ..< jm.freeList.len:
+      if jm.freeList[si].size >= needEarly:
+        let ri = jm.freeList[si].region
+        let off = jm.freeList[si].off
+        jit_copy(cast[pointer](jm.regions[ri].wbase + off), addr code[0], n)
+        let leftover = jm.freeList[si].size - needEarly
+        if leftover > 0:
+          jm.freeList[si] = FreeSlot(region: ri, off: off + needEarly, size: leftover)
+        else:
+          jm.freeList.del(si)
+        jm.totalCode = jm.totalCode + n
+        jm.lastLen = needEarly
+        return jit_offset(jm.regions[ri].base, off)
   let ps = jm.pageSize
   let last = jm.regions.len - 1
   if last >= 0 and jm.regions[last].wbase != 0:
@@ -207,6 +267,7 @@ proc install*(jm: var JitMemory; code: seq[byte]): pointer =
       jit_copy(cast[pointer](jm.regions[last].wbase + off), addr code[0], n)
       jm.regions[last].used = off + need
       jm.totalCode = jm.totalCode + n
+      jm.lastLen = need
       return jit_offset(jm.regions[last].base, off)
   if jitDualMap:
     let size = max(jm.regionSize, ((n + ps - 1) div ps) * ps)
@@ -214,7 +275,7 @@ proc install*(jm: var JitMemory; code: seq[byte]): pointer =
     let w = jit_map_dual(size, addr rx)
     if w != 0:
       jm.regions.add CodeRegion(base: cast[pointer](rx), size: size, used: 0, wbase: int(w))
-      return jm.install(code)
+      return jm.install(code)   # recursive retry: it sets jm.lastLen itself
     jitDualMap = false
   let need = ((n + ps - 1) div ps) * ps
   var ri = -1
@@ -223,14 +284,19 @@ proc install*(jm: var JitMemory; code: seq[byte]): pointer =
   if ri < 0:
     let size = max(jm.regionSize, need)
     let base = jit_map(size)
-    if base == nil: return nil
+    if base == nil:
+      jm.lastLen = 0
+      return nil
     jm.regions.add CodeRegion(base: base, size: size, used: 0, wbase: 0)
     ri = jm.regions.len - 1
   let dst = jit_offset(jm.regions[ri].base, jm.regions[ri].used)
   jit_copy(dst, addr code[0], n)
-  if jit_protect(dst, need, 1) != 0: return nil
+  if jit_protect(dst, need, 1) != 0:
+    jm.lastLen = 0
+    return nil
   jm.regions[ri].used = jm.regions[ri].used + need
   jm.totalCode = jm.totalCode + n
+  jm.lastLen = need
   dst
 
 proc detachShared*(jm: var JitMemory) =
